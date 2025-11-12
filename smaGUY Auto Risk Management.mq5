@@ -1,12 +1,6 @@
 //+------------------------------------------------------------------+
-//|                                                      ProjectName |
-//|                                      Copyright 2020, CompanyName |
-//|                                       http://www.companyname.net |
-//+------------------------------------------------------------------+
-
-//+------------------------------------------------------------------+
-//|                                            SimpleTradeManager.mq5 |
-//|                v14 Linear, planned+executed weighted TP/RR (full) |
+//|                                           SimpleTradeManager.mq5 |
+//|                                  smaGUY Auto Risk Management.mq5 |
 //+------------------------------------------------------------------+
 #property copyright "Simple Trade Manager"
 #property version   "14.00"
@@ -22,20 +16,26 @@ input double InpStopLoss = 1000;           // Stop Loss (points)
 input double InpTakeProfit = 5000;        // Take Profit (points)
 input double InpSlippageMargin = 100;      // Break-even offset (points)
 
+input group "=== Auto Partials ==="
+input bool InpEnablePartials = false;   // Enable Auto Partials
+input int  InpMaxPartials = 5;        // Maximum partial steps
+
+input group "=== Auto Break-Even ==="
+input bool   InpEnableBE = false;        // Enable Auto Break-Even
+input double InpBEPoints = 3000;           // BE Trigger (points in profit)
+
+input group "=== Auto Trailing Stop ==="
+input bool   InpEnableTrailing = false;   // Enable trailing stop
+input double InpTrailTrigger   = 3000;    // Trigger level (points in profit)
+input double InpTrailDistance  = 1000;    // Distance to trail (points)
+
 input group "=== Position Management ==="
 input bool   InpShowLines = true;         // Show BE/Partial Levels
 input bool   InpCombinePositions = true; // Combine positions as one pool
 
-input group "=== Auto Break-Even ==="
-input bool   InpEnableBE = true;        // Enable Auto Break-Even
-input double InpBEPoints = 3000;           // BE Trigger (points in profit)
-
-input group "=== Auto Partials ==="
-input bool InpEnablePartials = true;   // Enable Auto Partials
-input int    InpMaxPartials = 5;        // Maximum partial steps
-
 input group "=== Dashboard Settings ==="
 input bool InpEnableDashboard = true;   // Enable dashboard display
+input bool   InpSingleLineMode = true;
 enum ENUM_DASHBOARD_CORNER
   {
    DASH_CORNER_LEFT_UPPER = 0,
@@ -51,8 +51,6 @@ input string InpFontName = "Courier New";
 input int    InpFontSize = 16;
 input int    InpPriceDecimals = 2;
 input int    InpMoneyDecimals = 2;
-input bool   InpSingleLineMode = true;
-input bool   InpCenterLine = true;
 
 
 // ===============================
@@ -474,6 +472,8 @@ void OnTimer()
   {
    if(InpEnableBE)
       ManageBreakEven();
+   if(InpEnableTrailing)
+      ManageTrailingStop();
    if(InpEnableDashboard)
      {
       UpdateDashboard();
@@ -509,6 +509,54 @@ void ProcessAllTrades()
          if(symbol == _Symbol)
             SetOrderSLTP(ticket, symbol);
         }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+  {
+   if(!InpEnableTrailing)
+      return;
+   for(int i=0; i<PositionsTotal(); i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double entry   = PositionGetDouble(POSITION_PRICE_OPEN);
+      double volume  = PositionGetDouble(POSITION_VOLUME);
+      double sl      = PositionGetDouble(POSITION_SL);
+      double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      int    digits  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(type == POSITION_TYPE_BUY)
+        {
+         double profit_points = (bid - entry) / point;
+         if(profit_points >= InpTrailTrigger)
+           {
+            double new_sl = NormalizeDouble(bid - InpTrailDistance * point, digits);
+            if(new_sl > sl)
+               trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP));
+           }
+        }
+      else
+         if(type == POSITION_TYPE_SELL)
+           {
+            double profit_points = (entry - ask) / point;
+            if(profit_points >= InpTrailTrigger)
+              {
+               double new_sl = NormalizeDouble(ask + InpTrailDistance * point, digits);
+               if(new_sl < sl || sl == 0.0)
+                  trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP));
+              }
+           }
      }
   }
 
@@ -1075,7 +1123,7 @@ void UpdateDashboard()
      }
    double totalRisk = CalculateTotalRisk();
 // RR calculations
-   string currentRR = "∞", targetRR = "∞";
+   string currentRR = "âˆž", targetRR = "âˆž";
    if(totalRisk > 0.001)
      {
       currentRR = DoubleToString(MathAbs(totalPnL) / totalRisk, 1);
@@ -1103,7 +1151,7 @@ void DisplayNoPositions()
       string posStr = "No Open Positions";
       int chartW = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
       int totalW = GetTextPixelWidth(posStr);
-      int baseX = InpCenterLine ? (chartW - totalW) / 2 : InpXDistance;
+      int baseX = (chartW - totalW) / 2;
       SetDashText("Line1_Pos", posStr, colorText);
       ObjectSetInteger(0, "TM_Line1_Pos", OBJPROP_XDISTANCE, baseX);
       SetDashText("Line1_PnL", " ", colorText);
@@ -1155,7 +1203,7 @@ void DisplayDashboard(string dir, double lots, string entry, string pnl, double 
       int tpW  = GetTextPixelWidth(tpFullStr);
       int totalW = posW + pnlW + slW + tpW;
       int chartW = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
-      int baseX = InpCenterLine ? (chartW - totalW) / 2 : InpXDistance;
+      int baseX = (chartW - totalW) / 2;
       int xPos = baseX;
       SetDashText("Line1_Pos", posStr, colorText);
       ObjectSetInteger(0, "TM_Line1_Pos", OBJPROP_XDISTANCE, xPos);
