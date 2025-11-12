@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                        SimpleTradeManager_v15.mq5 |
+//|                              smaGUY Auto Risk Management.mq5.mq5 |
 //|                      Refactored: Always Combine, Fixed Partials  |
 //+------------------------------------------------------------------+
 #property copyright "Simple Trade Manager v15"
@@ -15,14 +15,17 @@ input group "=== Stop Loss & Take Profit ==="
 input double InpStopLoss = 1000;           // Stop Loss (points)
 input double InpTakeProfit = 5000;         // Take Profit (points)
 input double InpSlippageMargin = 100;      // Break-even offset (points)
+input bool   InpShowSLLevel = true;        // Show SL level line
 
 input group "=== Auto Partials ==="
 input bool InpEnablePartials = false;      // Enable Auto Partials
 input int  InpMaxPartials = 5;             // Maximum partial steps (excluding final TP)
+input bool InpShowPartialLevels = true;    // Show partial level lines
 
 input group "=== Auto Break-Even ==="
 input bool   InpEnableBE = false;          // Enable Auto Break-Even
 input double InpBEPoints = 3000;           // BE Trigger (points in profit)
+input bool   InpShowBELevel = true;        // Show BE level line
 
 input group "=== Auto Trailing Stop ==="
 input bool   InpEnableTrailing = false;    // Enable trailing stop
@@ -209,6 +212,61 @@ NetGroup CalculateNetGroup() {
 }
 
 // ===============================
+// Analyze positions for manual partials (different TPs)
+// ===============================
+struct ManualPartialInfo {
+   double tp_price;
+   double volume;
+   bool is_manual_partial;
+};
+
+void AnalyzeManualPartials(NetGroup &group, ManualPartialInfo &manual_partials[], double &auto_partial_volume) {
+   ArrayResize(manual_partials, 0);
+   auto_partial_volume = group.original_volume;
+   
+   if(group.ticket_count <= 1) return; // Only one position, no manual partials possible
+   
+   double avg_tp = (group.weighted_tp > 0) ? (group.weighted_tp / group.total_volume) : 0;
+   if(avg_tp <= 0) return;
+   
+   double avg_entry = group.weighted_entry / group.total_volume;
+   bool isBuy = (group.direction == "BUY" || (group.direction == "HEDG" && group.net_volume >= 0));
+   
+   // Check each position's TP
+   for(int i = 0; i < group.ticket_count; i++) {
+      if(!PositionSelectByTicket(group.tickets[i])) continue;
+      
+      double pos_tp = PositionGetDouble(POSITION_TP);
+      double pos_vol = PositionGetDouble(POSITION_VOLUME);
+      int idx = FindStateIndex(group.tickets[i]);
+      double orig_vol = (idx >= 0) ? position_states[idx].original_volume : pos_vol;
+      
+      if(pos_tp <= 0) continue;
+      
+      // Check if this TP is different from average (manual partial)
+      double tp_diff_percent = MathAbs(pos_tp - avg_tp) / avg_tp * 100.0;
+      
+      if(tp_diff_percent > 0.1) { // More than 0.1% different
+         // Check if this TP comes before the average TP (manual partial)
+         bool is_before = isBuy ? (pos_tp < avg_tp) : (pos_tp > avg_tp);
+         
+         if(is_before) {
+            int mp_idx = ArraySize(manual_partials);
+            ArrayResize(manual_partials, mp_idx + 1);
+            manual_partials[mp_idx].tp_price = pos_tp;
+            manual_partials[mp_idx].volume = orig_vol;
+            manual_partials[mp_idx].is_manual_partial = true;
+            
+            // Exclude this volume from auto-partial calculation
+            auto_partial_volume -= orig_vol;
+            
+            Print("Detected manual partial: TP=", pos_tp, " Vol=", orig_vol, " (excluded from auto-partials)");
+         }
+      }
+   }
+}
+
+// ===============================
 // Calculate feasible partials based on volume
 // ===============================
 int CalculateFeasiblePartials(double volume) {
@@ -258,8 +316,7 @@ double CalculateWeightedTP(NetGroup &group, int &feasible_partials_out) {
    
    // Total steps = feasible partials + 1 (for final TP)
    int total_steps = feasible_partials + 1;
-   double step_size = group.original_volume / total_steps;
-   step_size = NormalizeVolume(step_size);
+   double step_size = NormalizeVolume(group.original_volume / total_steps);
    
    // Calculate distance between entry and TP
    double total_distance = MathAbs(avg_tp - avg_entry);
@@ -353,14 +410,18 @@ void ManagePartials() {
    double profit_points = isBuy ? (current_price - avg_entry) / point : (avg_entry - current_price) / point;
    if(profit_points <= 0) return;
    
-   // Calculate feasible partials based on current volume
-   int feasible_partials = CalculateFeasiblePartials(group.original_volume);
+   // Analyze manual partials
+   ManualPartialInfo manual_partials[];
+   double auto_partial_volume = 0;
+   AnalyzeManualPartials(group, manual_partials, auto_partial_volume);
+   
+   // Calculate feasible partials based on auto-partial volume only
+   int feasible_partials = CalculateFeasiblePartials(auto_partial_volume);
    if(feasible_partials < 1) return;
    
-   // Calculate partial parameters
+   // Calculate partial parameters - ALL steps get equal volume (including final TP)
    int total_steps = feasible_partials + 1;
-   double step_size = group.original_volume / total_steps;
-   step_size = NormalizeVolume(step_size);
+   double step_size = NormalizeVolume(auto_partial_volume / total_steps);
    if(step_size < min_lot) return;
    
    double total_distance = MathAbs(avg_tp - avg_entry);
@@ -375,12 +436,23 @@ void ManagePartials() {
    bool level_reached = isBuy ? (current_price >= next_level) : (current_price <= next_level);
    if(!level_reached) return;
    
-   // Close partial volume from pool
+   // Close partial volume from pool (only from positions without manual partials)
    double remaining_to_close = step_size;
    
    for(int i = 0; i < group.ticket_count && remaining_to_close >= min_lot; i++) {
       ulong ticket = group.tickets[i];
       if(!PositionSelectByTicket(ticket)) continue;
+      
+      // Check if this position has a manual partial TP
+      double pos_tp = PositionGetDouble(POSITION_TP);
+      bool is_manual_partial = false;
+      for(int j = 0; j < ArraySize(manual_partials); j++) {
+         if(MathAbs(pos_tp - manual_partials[j].tp_price) < point) {
+            is_manual_partial = true;
+            break;
+         }
+      }
+      if(is_manual_partial) continue; // Skip manual partial positions
       
       double pos_vol = PositionGetDouble(POSITION_VOLUME);
       if(pos_vol < min_lot) continue;
@@ -393,7 +465,7 @@ void ManagePartials() {
          if(trade.PositionClosePartial(ticket, close_vol)) {
             RecordPartialExecution(ticket, close_vol, current_price);
             remaining_to_close -= close_vol;
-            Print("Partial step ", (group.step_done + 1), "/", feasible_partials, " closed ", close_vol, 
+            Print("Auto-Partial TP", (group.step_done + 1), " closed ", close_vol, 
                   " lots from #", ticket, " at ", current_price);
          }
       }
@@ -694,6 +766,7 @@ void DisplayNoPositions() {
 void DrawHLine(string name, double price, color clr, ENUM_LINE_STYLE style, string label) {
    if(ObjectFind(0, name) >= 0) {
       ObjectSetDouble(0, name, OBJPROP_PRICE, price);
+      ObjectSetString(0, name, OBJPROP_TEXT, label);
       return;
    }
    ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
@@ -717,35 +790,105 @@ void UpdateLines() {
    int active_count = 0;
    
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    double avg_entry = group.weighted_entry / group.total_volume;
    double avg_tp = (group.weighted_tp > 0) ? (group.weighted_tp / group.total_volume) : 0;
+   double avg_sl = (group.weighted_sl > 0) ? (group.weighted_sl / group.total_volume) : 0;
    bool isBuy = (group.direction == "BUY" || (group.direction == "HEDG" && group.net_volume >= 0));
    
-   // Draw BE line
-   if(InpEnableBE) {
+   // Draw SL line with risk info
+   if(InpShowSLLevel && avg_sl > 0) {
+      double total_risk = CalculateTotalRisk(group);
+      string sl_label = "SL " + DoubleToString(group.total_volume, 2) + "@" + 
+                       DoubleToString(avg_sl, digits) + " " + 
+                       currencySymbol + DoubleToString(total_risk, 2);
+      DrawHLine("TM_Line_SL", avg_sl, colorSL, STYLE_DOT, sl_label);
+      ArrayResize(active_lines, active_count + 1);
+      active_lines[active_count++] = "TM_Line_SL";
+   }
+   
+   // Draw BE line (entry price with volume)
+   if(InpShowBELevel) {
       double be_price = avg_entry + InpSlippageMargin * point * (isBuy ? 1 : -1);
-      DrawHLine("TM_Line_BE", be_price, clrYellow, STYLE_DOT, "Break-Even");
+      string be_label = group.direction + " " + DoubleToString(group.total_volume, 2) + "@" + 
+                       DoubleToString(avg_entry, digits);
+      DrawHLine("TM_Line_BE", be_price, clrYellow, STYLE_DOT, be_label);
       ArrayResize(active_lines, active_count + 1);
       active_lines[active_count++] = "TM_Line_BE";
    }
    
-   // Draw partial lines
-   if(InpEnablePartials && avg_tp > 0) {
-      // Calculate feasible partials based on volume
-      int feasible_partials = CalculateFeasiblePartials(group.original_volume);
+   // Draw partial lines with detailed info
+   if(InpShowPartialLevels && InpEnablePartials && avg_tp > 0) {
+      // Analyze manual partials
+      ManualPartialInfo manual_partials[];
+      double auto_partial_volume = 0;
+      AnalyzeManualPartials(group, manual_partials, auto_partial_volume);
       
-      if(feasible_partials > 0) {
-         int total_steps = feasible_partials + 1;
-         double total_distance = MathAbs(avg_tp - avg_entry);
-         double step_distance = total_distance / total_steps;
+      // Calculate feasible auto-partials
+      int feasible_partials = CalculateFeasiblePartials(auto_partial_volume);
+      
+      if(feasible_partials > 0 || ArraySize(manual_partials) > 0) {
+         int total_tp_count = 0;
          
-         // Only draw remaining partials (not yet executed)
-         for(int step = group.step_done; step < feasible_partials; step++) {
-            double distance = step_distance * (step + 1);
-            double level_price = avg_entry + (isBuy ? distance : -distance);
-            string line_name = "TM_Line_P" + IntegerToString(step + 1);
-            DrawHLine(line_name, level_price, clrGray, STYLE_DOT, 
-                     "Partial " + IntegerToString(step + 1) + "/" + IntegerToString(feasible_partials));
+         // Draw manual partial lines first
+         for(int i = 0; i < ArraySize(manual_partials); i++) {
+            total_tp_count++;
+            string line_name = "TM_Line_TP" + IntegerToString(total_tp_count);
+            double reward = 0;
+            if(isBuy) reward = (manual_partials[i].tp_price - avg_entry) / point * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * manual_partials[i].volume;
+            else reward = (avg_entry - manual_partials[i].tp_price) / point * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * manual_partials[i].volume;
+            
+            string label = "TP" + IntegerToString(total_tp_count) + " " + 
+                          DoubleToString(manual_partials[i].volume, 2) + "@" + 
+                          DoubleToString(manual_partials[i].tp_price, digits) + " " + 
+                          currencySymbol + DoubleToString(reward, 2);
+            DrawHLine(line_name, manual_partials[i].tp_price, clrCyan, STYLE_DOT, label);
+            ArrayResize(active_lines, active_count + 1);
+            active_lines[active_count++] = line_name;
+         }
+         
+         // Draw auto-partial lines
+         if(feasible_partials > 0 && auto_partial_volume >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)) {
+            int total_steps = feasible_partials + 1;
+            double step_size = NormalizeVolume(auto_partial_volume / total_steps);
+            
+            double total_distance = MathAbs(avg_tp - avg_entry);
+            double step_distance = total_distance / total_steps;
+            
+            // Only draw remaining auto-partials (not yet executed)
+            for(int step = group.step_done; step < feasible_partials; step++) {
+               total_tp_count++;
+               double distance = step_distance * (step + 1);
+               double level_price = avg_entry + (isBuy ? distance : -distance);
+               
+               double reward = 0;
+               if(isBuy) reward = (level_price - avg_entry) / point * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * step_size;
+               else reward = (avg_entry - level_price) / point * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * step_size;
+               
+               string line_name = "TM_Line_TP" + IntegerToString(total_tp_count);
+               string label = "TP" + IntegerToString(total_tp_count) + " " + 
+                             DoubleToString(step_size, 2) + "@" + 
+                             DoubleToString(level_price, digits) + " " + 
+                             currencySymbol + DoubleToString(reward, 2);
+               
+               DrawHLine(line_name, level_price, clrGray, STYLE_DOT, label);
+               ArrayResize(active_lines, active_count + 1);
+               active_lines[active_count++] = line_name;
+            }
+            
+            // Draw final TP line (same volume as other steps)
+            total_tp_count++;
+            double final_reward = 0;
+            if(isBuy) final_reward = (avg_tp - avg_entry) / point * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * step_size;
+            else final_reward = (avg_entry - avg_tp) / point * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * step_size;
+            
+            string line_name = "TM_Line_TP" + IntegerToString(total_tp_count);
+            string label = "TP" + IntegerToString(total_tp_count) + " " + 
+                          DoubleToString(step_size, 2) + "@" + 
+                          DoubleToString(avg_tp, digits) + " " + 
+                          currencySymbol + DoubleToString(final_reward, 2);
+            
+            DrawHLine(line_name, avg_tp, clrLimeGreen, STYLE_DOT, label);
             ArrayResize(active_lines, active_count + 1);
             active_lines[active_count++] = line_name;
          }
