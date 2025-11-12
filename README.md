@@ -1,6 +1,13 @@
 # MT5-Full-Risk-Management-helper-EA
 Auto SL/TP, Auto BE, Auto Partials, Total Exposure display with weighted RR and TP based on planned partials
 
+> [!WARNING]
+> Mostly AI-Generated.
+> Still under heavy testing and devlopment 
+> Test on demo account to familirize yourself with the settings
+
+
+
 <img width="501" height="587" alt="Screenshot_20251112_135618" src="https://github.com/user-attachments/assets/9a71d5ad-f152-43a9-9cb1-27e728f3c734" />
 
 
