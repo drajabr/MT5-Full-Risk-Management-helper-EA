@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
-//|                              smaGUY Auto Risk Management.mq5.mq5 |
-//|                      Refactored: Always Combine, Fixed Partials  |
+//|                                  smaGUY Auto Risk Management.mq5 |
+//|                                                                  |
 //+------------------------------------------------------------------+
 #property copyright "Simple Trade Manager v15"
 #property version   "15.00"
@@ -1023,7 +1023,6 @@ void UpdateLines()
       int total_units = (int)MathRound(auto_partial_volume / lot_step_local);
       if(feasible_partials + 1 > total_units)
          feasible_partials = MathMax(0, total_units - 1);
-      if(feasible_partials > 0 || ArraySize(manual_partials) > 0)
         {
          int total_tp_count = 0;
          // Draw manual partial lines first
@@ -1045,7 +1044,6 @@ void UpdateLines()
             active_lines[active_count++] = line_name;
            }
          // Draw auto-partial lines
-         if(feasible_partials > 0 && auto_partial_volume >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
            {
             int total_steps = feasible_partials + 1;
             double step_plan[];
